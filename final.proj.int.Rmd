@@ -1,0 +1,642 @@
+---
+title: "final.proj.int"
+author: "Zunqiu Wang"
+date: "8/10/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(GEOquery)
+gse <- getGEO("GSE179320")
+data <- gse$GSE179320_series_matrix.txt.gz
+data@experimentData
+data$data_processing
+data$geo_accession
+data$`cell type:ch1`
+data$`treatment:ch1`
+
+expdesign = data.frame(sample=data$geo_accession,
+                       condition=factor(data$`treatment:ch1`),
+                       cell=factor(data$`cell type:ch1`))
+rownames(expdesign) <- data$geo_accession
+
+### expdesign$condition.cell <- factor(paste0(expdesign$condition,"-",expdesign$cell))
+
+
+
+
+```
+
+```{r}
+list_of_files <- list.files(path = ".", recursive = TRUE,
+                            pattern = "\\.tsv$", 
+                            full.names = TRUE)
+tablist <- lapply(list_of_files, function(x) read.table(x, header=T))
+sub.tablist <- lapply(tablist, function(x) x[,c(1,4)])
+raw.count = do.call("cbind", sub.tablist)
+rownames(raw.count) <- raw.count$target_id
+raw.count <- raw.count[!duplicated(as.list(raw.count))]
+raw.count$target_id <- NULL
+names(raw.count) <- c("AAVS1_MC_1","AAVS1_MC_2","AAVS1_MC_3","AAVS1_NP_1","AAVS1_NP_2","AAVS1_NP_3",
+                      "AAVS1_PM_1","AAVS1_PM_2","AAVS1_PM_3","AK2_MC_1","AK2_MC_2","AK2_MC_3","AK2_NP_1","AK2_NP_2","AK2_NP_3","AK2_PM_1","AK2_PM_2","AK2_PM_3")
+
+## check if normalized?
+raw.count.drop.zero <- raw.count[rowSums(raw.count[])>0,]
+raw.count.drop.zero$transcript_id <- rownames(raw.count.drop.zero)
+library(reshape2)
+library(ggplot2)
+raw.count.drop.zero.melt = melt(raw.count.drop.zero)
+ggplot(raw.count.drop.zero.melt, aes(x=variable, y=log2(value + 1))) + geom_boxplot()
+
+# rownames(raw.count) <- unlist(lapply(strsplit(rownames(raw.count), '\\.'),function(x){x[1]})
+tab <- read.table("mart_export.txt", sep='\t', header=T)
+idx <- match(rownames(raw.count), tab$Transcript.stable.ID.version)
+meta.table <- tab[idx,]
+meta.table$Gene.name <- NULL
+library(org.Hs.eg.db)
+xxd <- toTable(org.Hs.egSYMBOL)
+yyd <- toTable(org.Hs.egENSEMBL2EG)
+ann <- merge(xxd,yyd, by="gene_id")
+meta.table$ensembl_id = meta.table$Gene.stable.ID
+meta.table$Gene.stable.ID <- NULL
+
+meta.table.merge <- merge(ann,meta.table,by="ensembl_id")
+
+raw.count.meta.table.drop.dup <- meta.table.merge[!duplicated(meta.table.merge$gene_id),] #drop duplicated gene_id
+
+```
+
+
+```{r}
+library(DESeq2)
+### set base level in each factor
+expdesign$condition <- relevel(expdesign$condition, "AAVS1 CRISPR") ###*********
+expdesign$cell <- relevel(expdesign$cell, "Myelocyte")
+
+### expdesign$condition.cell <- relevel(expdesign$condition.cell, "AAVS1 CRISPR-Promyelocyte")  ###*********
+cds <- DESeqDataSetFromMatrix(countData = round(raw.count[rowSums(raw.count[])>0,]),
+                                 colData = expdesign,
+                                 design = ~ cell + condition + cell:condition) ###*********
+
+keep <- rowSums(counts(cds)) >= 10 ##prefilter counts below 10   **********8
+cds <- cds[keep, ]
+dim(cds)
+
+## PCA
+rld <- rlog(cds)
+library(ggplot2)
+library(ggrepel)
+
+                                  ### one outlier in treated? PC1 and PC2 both large +
+                                           ### all seperates by condition on PC2
+
+pca <- plotPCA(rld, intgroup=c("condition","cell"), returnData=TRUE)
+percentVar <- round(100 * attr(pca, "percentVar"))
+png("raw.PCA.png")
+ggplot(pca, aes(x=PC1, y=PC2, color=condition, shape=cell)) +
+  geom_point(size=3) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  geom_text_repel(aes(label=condition)) +
+  labs(title="PCA plot") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  coord_fixed()
+dev.off()
+```
+
+```{r}
+cds <- DESeq(cds)
+resultsNames(cds)
+
+## check design matrix
+mod_mat <- model.matrix(design(cds), colData(cds))
+
+## coef vectors for each factor
+pro_AAVS1 <- colMeans(mod_mat[cds$cell == "Promyelocyte" & cds$condition == "AAVS1 CRISPR", ])
+pro_AK2 <- colMeans(mod_mat[cds$cell == "Promyelocyte" & cds$condition == "AK2 CRISPR", ])
+neu_AAVS1 <- colMeans(mod_mat[cds$cell == "Neutrophil" & cds$condition == "AAVS1 CRISPR", ])
+neu_AK2 <- colMeans(mod_mat[cds$cell == "Neutrophil" & cds$condition == "AK2 CRISPR", ])
+
+## results of cds with interaction term
+res.int <- results(cds,name = "cellPromyelocyte.conditionAK2.CRISPR") # interaction effect 
+
+summary(res.int)
+
+```
+
+```{r}
+sum(res.int$padj < 0.05 & abs(res.int$log2FoldChange) > 1, na.rm=T)
+
+resSigind = res.int[ which(res.int$padj < 0.05 & res.int$log2FoldChange > 1), ]
+resSigrep = res.int[ which(res.int$padj < 0.05 & res.int$log2FoldChange < -1), ]
+resSig = rbind(resSigind, resSigrep)
+
+## save table 
+pwd <- getwd()
+write.table(resSig, file = paste0(pwd, "/resSig.csv"), sep = "\t", col.names = NA)
+
+diffexpgenes = rownames(resSig)
+
+normvalues <- counts(cds, normalized=T)
+
+# diffexpvalues
+idx2 <- match(diffexpgenes,rownames(normvalues))
+diffexpvalues <- normvalues[idx2,]
+
+## save table
+write.table(diffexpvalues, file = paste0(pwd, "/diffexpvalues.csv"), sep = "\t", col.names = NA)
+
+dim(diffexpvalues)
+```
+
+```{r}
+
+## check if interaction effect for a particular transcript across all samples
+diffexpgenes
+
+library(reshape2)
+norm_melt = melt(normvalues)
+## interaction effect?
+
+gene2draw.ENST00000620254.5 = subset(norm_melt, Var1=="ENST00000620254.5")
+
+library(ggplot2)
+png("gene2draw.ENST00000620254.5.png")
+ggplot(gene2draw.ENST00000620254.5) +
+  geom_bar(mapping = aes(x=Var2, y=value), stat="identity")
+dev.off()
+
+png("gene2draw.ENST00000341757.9.png")
+gene2draw.ENST00000341757.9 = subset(norm_melt, Var1=="ENST00000341757.9")
+ggplot(gene2draw.ENST00000341757.9) +
+  geom_bar(mapping = aes(x=Var2, y=value), stat="identity")
+dev.off()
+
+png("gene2draw.ENST00000316081.11.png")
+gene2draw.ENST00000316081.11 = subset(norm_melt, Var1=="ENST00000316081.11")
+ggplot(gene2draw.ENST00000316081.11) +
+  geom_bar(mapping = aes(x=Var2, y=value), stat="identity")
+dev.off()
+
+```
+
+```{r}
+idx3 <- match(rownames(diffexpvalues), meta.table.merge$Transcript.stable.ID.version) #match transcript id
+diffexpvalues.matched.meta.table <- meta.table.merge[idx3,] # subset those matched in diffexpvales
+diffexpvalues.matched.meta.table.drop.na <- diffexpvalues.matched.meta.table[!is.na(diffexpvalues.matched.meta.table$gene_id),] #drop row with na
+
+##save table
+pwd <- getwd()
+write.table(diffexpvalues.matched.meta.table.drop.na, file = paste0(pwd, "/diffexpvalues.matched.meta.drop.na.csv"), sep = "\t", col.names = NA)
+```
+
+```{r}
+#diffexpvalues PCA
+diffexpvalues.prcomp <- prcomp(t(diffexpvalues), scale=TRUE, center=TRUE)
+
+## check variances of PC
+## save plot
+png("diffexpvalues.prcomp.png")
+plot(diffexpvalues.prcomp)
+dev.off()
+
+
+diffexpvalues.coords2draw <- cbind(as.data.frame(diffexpvalues.prcomp$x), expdesign)
+vars_transformed <- apply(diffexpvalues.prcomp$x, 2, var)
+## or diffexpvalues.prcomp$sdev^2
+percent.var <- vars_transformed/sum(vars_transformed)
+library(ggrepel)
+ggplot(diffexpvalues.coords2draw, aes(x = PC1, y= PC2, 
+                         col=cell, shape=condition)) +
+  geom_point(size=3) +
+  xlab(paste0("PC1: ",round(100*percent.var[1]),"% variance")) +
+  ylab(paste0("PC2: ",round(100*percent.var[2]),"% variance")) + 
+  geom_text_repel(aes(label=condition)) +
+  labs(title="diff.PCA plot") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  coord_fixed()
+ggsave("diffexpvalues.PCA.png")
+```
+
+```{r}
+diffexpvalues.drop.zero.count <- diffexpvalues[rowSums(diffexpvalues[])>0,]
+t.diffexpvalues.drop.zero.count <- t(diffexpvalues.drop.zero.count)
+## calculate distance and clustering
+diffexpvalues.cor <- cor(t.diffexpvalues.drop.zero.count)
+diffexpvalues.dist <- as.dist(1-diffexpvalues.cor)
+diffexp.clust <- hclust(diffexpvalues.dist, method='average')
+```
+
+```{r}
+## check width distr to determine best k value 
+library(cluster)
+avg.sil.values=numeric()
+avg.sil.values[1]=0
+for (i in 2:20) {
+  temp.clusters = cutree(diffexp.clust, k=i) 
+  silhouette(temp.clusters, dist=diffexpvalues.dist)-> temp.cluster.sil
+  avg.sil.values[i]=mean(temp.cluster.sil[,"sil_width"])
+}
+
+##save plot
+png("avg.sil.values.png")
+plot(avg.sil.values)
+dev.off()
+
+diffexp.clust.groups <- cutree(diffexp.clust,k=9) ## *********
+diffexp.clust.groups.df <- data.frame(cluster = diffexp.clust.groups)
+diffexp.clust.groups.df$cluster
+
+diffexp.clust.groups.df <- data.frame(cluster = as.character(diffexp.clust.groups.df$cluster))
+rownames(diffexp.clust.groups.df) <- diffexpgenes
+
+table(diffexp.clust.groups)
+
+
+library(cluster)
+diffexp.clust.sil = silhouette(diffexp.clust.groups, diffexpvalues.dist)
+
+##save plot
+pdf("diffexp.sil.pdf")
+plot(diffexp.clust.sil, col="blue", border=NA)
+dev.off()
+
+group1names = names(which(diffexp.clust.groups==1))
+summary(group1names)
+group2names = names(which(diffexp.clust.groups==2))
+summary(group2names)
+group3names = names(which(diffexp.clust.groups==3))
+group4names = names(which(diffexp.clust.groups==4))
+group5names = names(which(diffexp.clust.groups==5))
+group6names = names(which(diffexp.clust.groups==6))
+group7names = names(which(diffexp.clust.groups==7))
+group8names = names(which(diffexp.clust.groups==8))
+group9names = names(which(diffexp.clust.groups==9))
+
+```
+
+```{r}
+library(pheatmap)
+my_sample_col <- expdesign
+my_sample_col$sample = NULL
+rownames(my_sample_col) <- colnames(diffexpvalues)
+ 
+my_sample_col
+heatmap <- pheatmap(diffexpvalues.drop.zero.count, cluster_rows=diffexp.clust, scale = "row", cutree_rows = 9, cutree_cols = 3, annotation_col=my_sample_col, annotation_row=diffexp.clust.groups.df, main="complete heatmap", color = colorRampPalette(c("blue", "white", "red"))(50), angle_col = 45) ##show_colnames=F if dont want sample name
+
+save_pheatmap_pdf <- function(x, filename, width=20, height=20) {
+  stopifnot(!missing(x))
+  stopifnot(!missing(filename))
+  pdf(filename, width=width, height=height)
+  grid::grid.newpage()
+  grid::grid.draw(x$gtable)
+  dev.off()   
+}      
+save_pheatmap_pdf(heatmap, "complete_heatmap.int.pdf")
+
+```
+
+```{r}
+##Hierachical clustering
+diff.cor <- cor(diffexpvalues[rowSums(diffexpvalues[])>0,])
+
+diff.dist <- as.dist(1-diff.cor)
+
+diff.clust <- hclust(diff.dist, method='average')
+
+##save cell plot
+diff.clust$labels <- expdesign$cell
+png("diffexp.clust.cell.png")
+plot(diff.clust) ## samples cluster together according to cell type
+dev.off()
+
+##save condition plot
+diff.clust$labels <- expdesign$condition
+png("diffexp.clust.condition.png")
+plot(diff.clust) ## some samples accroding to condition DONOT cluster together
+dev.off()
+
+##save sample plot
+diff.clust$labels <- expdesign$sample
+png("diffexp.clust.sample.png")
+plot(diff.clust) ## some samples accrording to sample DONOT cluster together
+dev.off()
+```
+
+```{r fig.height=10, fig.width=10}
+##using clusterprofilerto do GO analysis
+library(clusterProfiler)
+library(org.Hs.eg.db)
+ego <- enrichGO(gene          = diffexpvalues.matched.meta.table.drop.na$gene_id,
+                universe      = raw.count.meta.table.drop.dup$gene_id,
+                OrgDb         = org.Hs.eg.db,
+                ont           = "ALL",
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 0.01,
+        readable      = TRUE)
+go.res <- as.data.frame(ego@result)
+
+##save table
+write.table(go.res, file = paste0(pwd, "/GO.res.csv"),sep = "\t", row.names = FALSE)
+
+##save plot
+png("go.bar.png")
+barplot(ego, split="ONTOLOGY",showCategory = 10) + facet_grid(ONTOLOGY~., scale="free")
+dev.off()
+
+png("go.dot.png")
+dotplot(ego, split="ONTOLOGY",showCategory = 10) + facet_grid(ONTOLOGY~., scale="free")
+dev.off()
+
+##subset top 10 for each ontology category 
+library(dplyr)
+go.res.top.10 <- go.res %>% group_by(ONTOLOGY) %>% top_n(n=-10,wt=p.adjust)
+
+##save table
+write.table(go.res.top.10, file = paste0(pwd, "/go.res.top.10.csv"),sep = "\t", row.names = FALSE)
+
+## plot top 10 GO 
+ggplot(go.res.top.10, aes(x=Description, y=-log10(p.adjust), fill=ONTOLOGY)) +
+  geom_bar(stat="identity") +    
+  coord_flip()+    
+  scale_x_discrete(limits=rev(go.res.top.10$Description))+   
+  theme_classic()+  
+  theme(
+        text = element_text(size=20),   
+        axis.title.y=element_blank(),   
+        axis.title.x=element_text(size=15),   
+        legend.title=element_blank()          
+        )
+## save plot
+ggsave("go.res.top.10.png")
+```
+
+
+```{r}
+##For group 1
+### heatmap for group1
+grp1.heatmap = pheatmap(diffexpvalues.drop.zero.count[names(which(diffexp.clust.groups==1)),], scale = "row", annotation_col=my_sample_col, annotation_row=diffexp.clust.groups.df, clustering_distance_rows = "correlation",main="grp1 heatmap", color = colorRampPalette(c("blue", "white", "red"))(50), angle_col = 45)
+
+save_pheatmap_pdf <- function(x, filename, width=20, height=20) {
+  stopifnot(!missing(x))
+  stopifnot(!missing(filename))
+  pdf(filename, width=width, height=height)
+  grid::grid.newpage()
+  grid::grid.draw(x$gtable)
+  dev.off()   
+}      
+save_pheatmap_pdf(grp1.heatmap, "grp1.heatmap.pdf")
+
+
+cluster1genes = diffexpvalues[diffexp.clust.groups==1, ]
+cluster1match.diffexpvalues.matched.meta.table.drop.na <- na.omit(diffexpvalues.matched.meta.table.drop.na[match(rownames(cluster1genes),diffexpvalues.matched.meta.table.drop.na$Transcript.stable.ID.version),])
+
+### GO terms for group1
+ego.grp1 <- enrichGO(gene     = cluster1match.diffexpvalues.matched.meta.table.drop.na$gene_id,
+                universe      = raw.count.meta.table.drop.dup$gene_id,
+                OrgDb         = org.Hs.eg.db,
+                ont           = "ALL",
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 0.01,
+        readable      = TRUE)
+go.res.grp1 <- as.data.frame(ego.grp1@result)
+
+##save plot
+png("grp1.GO.bar.png")
+barplot(ego.grp1, split="ONTOLOGY",showCategory = 10) + facet_grid(ONTOLOGY~., scale="free")
+dev.off()
+
+png("grp1.GO.dot.png")
+dotplot(ego.grp1, split="ONTOLOGY",showCategory = 10) + facet_grid(ONTOLOGY~., scale="free")
+dev.off()
+```
+
+```{r}
+##For group 2
+### heatmap for group2
+grp2.heatmap = pheatmap(diffexpvalues.drop.zero.count[names(which(diffexp.clust.groups==2)),], scale = "row", annotation_col=my_sample_col, annotation_row=diffexp.clust.groups.df, clustering_distance_rows = "correlation",main="grp2 heatmap", color = colorRampPalette(c("blue", "white", "red"))(50), angle_col = 45)
+
+save_pheatmap_pdf <- function(x, filename, width=20, height=20) {
+  stopifnot(!missing(x))
+  stopifnot(!missing(filename))
+  pdf(filename, width=width, height=height)
+  grid::grid.newpage()
+  grid::grid.draw(x$gtable)
+  dev.off()   
+}      
+save_pheatmap_pdf(grp2.heatmap, "grp2.heatmap.pdf")
+
+
+cluster2genes = diffexpvalues[diffexp.clust.groups==2, ]
+cluster2match.diffexpvalues.matched.meta.table.drop.na <- na.omit(diffexpvalues.matched.meta.table.drop.na[match(rownames(cluster2genes),diffexpvalues.matched.meta.table.drop.na$Transcript.stable.ID.version),])
+
+### GO terms for group2
+ego.grp2 <- enrichGO(gene     = cluster2match.diffexpvalues.matched.meta.table.drop.na$gene_id,
+                universe      = raw.count.meta.table.drop.dup$gene_id,
+                OrgDb         = org.Hs.eg.db,
+                ont           = "ALL",
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 0.01,
+        readable      = TRUE)
+go.res.grp2 <- as.data.frame(ego.grp2@result) ##NO enriched
+
+##save plot
+png("grp2.GO.bar.png")
+barplot(ego.grp2, split="ONTOLOGY",showCategory = 10) + facet_grid(ONTOLOGY~., scale="free")
+dev.off()
+
+png("grp2.GO.dot.png")
+dotplot(ego.grp2, split="ONTOLOGY",showCategory = 10) + facet_grid(ONTOLOGY~., scale="free")
+dev.off()
+```
+
+```{r}
+##for group3
+cluster3genes = diffexpvalues[diffexp.clust.groups==3, ]
+cluster3match.diffexpvalues.matched.meta.table.drop.na <- na.omit(diffexpvalues.matched.meta.table.drop.na[match(rownames(cluster3genes),diffexpvalues.matched.meta.table.drop.na$Transcript.stable.ID.version),])
+
+### GO terms for group3
+ego.grp3 <- enrichGO(gene     = cluster3match.diffexpvalues.matched.meta.table.drop.na$gene_id,
+                universe      = raw.count.meta.table.drop.dup$gene_id,
+                OrgDb         = org.Hs.eg.db,
+                ont           = "ALL",
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 0.01,
+        readable      = TRUE)
+go.res.grp3 <- as.data.frame(ego.grp3@result)
+
+##save plot
+png("grp3.GO.bar.png")
+barplot(ego.grp3, split="ONTOLOGY",showCategory = 10) + facet_grid(ONTOLOGY~., scale="free")
+dev.off()
+
+png("grp3.GO.dot.png")
+dotplot(ego.grp3, split="ONTOLOGY",showCategory = 10) + facet_grid(ONTOLOGY~., scale="free")
+dev.off()
+```
+
+
+```{r}
+##for group 4
+cluster4genes = diffexpvalues[diffexp.clust.groups==4, ]
+cluster4match.diffexpvalues.matched.meta.table.drop.na <- na.omit(diffexpvalues.matched.meta.table.drop.na[match(rownames(cluster4genes),diffexpvalues.matched.meta.table.drop.na$Transcript.stable.ID.version),])
+
+### GO terms for group4
+ego.grp4 <- enrichGO(gene     = cluster4match.diffexpvalues.matched.meta.table.drop.na$gene_id,
+                universe      = raw.count.meta.table.drop.dup$gene_id,
+                OrgDb         = org.Hs.eg.db,
+                ont           = "ALL",
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 0.01,
+        readable      = TRUE)
+go.res.grp4 <- as.data.frame(ego.grp4@result) ## NO enriched
+
+##save plot
+png("grp4.GO.bar.png")
+barplot(ego.grp4, split="ONTOLOGY",showCategory = 10) + facet_grid(ONTOLOGY~., scale="free")
+dev.off()
+
+png("grp4.GO.dot.png")
+dotplot(ego.grp4, split="ONTOLOGY",showCategory = 10) + facet_grid(ONTOLOGY~., scale="free")
+dev.off()
+
+
+```
+
+
+```{r}
+##for group 5
+cluster5genes = diffexpvalues[diffexp.clust.groups==5, ]
+cluster5match.diffexpvalues.matched.meta.table.drop.na <- na.omit(diffexpvalues.matched.meta.table.drop.na[match(rownames(cluster5genes),diffexpvalues.matched.meta.table.drop.na$Transcript.stable.ID.version),])
+
+### GO terms for group5
+ego.grp5 <- enrichGO(gene     = cluster5match.diffexpvalues.matched.meta.table.drop.na$gene_id,
+                universe      = raw.count.meta.table.drop.dup$gene_id,
+                OrgDb         = org.Hs.eg.db,
+                ont           = "ALL",
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 0.01,
+        readable      = TRUE)
+go.res.grp5 <- as.data.frame(ego.grp5@result)
+
+##save plot
+png("grp5.GO.bar.png")
+barplot(ego.grp5, split="ONTOLOGY",showCategory = 10) + facet_grid(ONTOLOGY~., scale="free")
+dev.off()
+
+png("grp5.GO.dot.png")
+dotplot(ego.grp5, split="ONTOLOGY",showCategory = 10) + facet_grid(ONTOLOGY~., scale="free")
+dev.off()
+
+
+```
+
+
+```{r}
+## for group 6
+cluster6genes = diffexpvalues[diffexp.clust.groups==6, ]
+cluster6match.diffexpvalues.matched.meta.table.drop.na <- na.omit(diffexpvalues.matched.meta.table.drop.na[match(rownames(cluster6genes),diffexpvalues.matched.meta.table.drop.na$Transcript.stable.ID.version),])
+
+### GO terms for group6
+ego.grp6 <- enrichGO(gene     = cluster6match.diffexpvalues.matched.meta.table.drop.na$gene_id,
+                universe      = raw.count.meta.table.drop.dup$gene_id,
+                OrgDb         = org.Hs.eg.db,
+                ont           = "ALL",
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 0.01,
+        readable      = TRUE)
+go.res.grp6 <- as.data.frame(ego.grp6@result)
+
+##save plot
+png("grp6.GO.bar.png")
+barplot(ego.grp6, split="ONTOLOGY",showCategory = 10) + facet_grid(ONTOLOGY~., scale="free")
+dev.off()
+
+png("grp6.GO.dot.png")
+dotplot(ego.grp6, split="ONTOLOGY",showCategory = 10) + facet_grid(ONTOLOGY~., scale="free")
+dev.off()
+```
+
+```{r}
+## for group 7
+cluster7genes = diffexpvalues[diffexp.clust.groups==7, ]
+cluster7match.diffexpvalues.matched.meta.table.drop.na <- na.omit(diffexpvalues.matched.meta.table.drop.na[match(rownames(cluster7genes),diffexpvalues.matched.meta.table.drop.na$Transcript.stable.ID.version),])
+
+### GO terms for group6
+ego.grp7 <- enrichGO(gene     = cluster7match.diffexpvalues.matched.meta.table.drop.na$gene_id,
+                universe      = raw.count.meta.table.drop.dup$gene_id,
+                OrgDb         = org.Hs.eg.db,
+                ont           = "ALL",
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 0.01,
+        readable      = TRUE)
+go.res.grp7 <- as.data.frame(ego.grp7@result)
+
+##save plot
+png("grp7.GO.bar.png")
+barplot(ego.grp7, split="ONTOLOGY",showCategory = 10) + facet_grid(ONTOLOGY~., scale="free")
+dev.off()
+
+png("grp7.GO.dot.png")
+dotplot(ego.grp7, split="ONTOLOGY",showCategory = 10) + facet_grid(ONTOLOGY~., scale="free")
+dev.off()
+
+
+```
+
+```{r}
+## for group 8
+cluster8genes = diffexpvalues[diffexp.clust.groups==8, ]
+cluster8match.diffexpvalues.matched.meta.table.drop.na <- na.omit(diffexpvalues.matched.meta.table.drop.na[match(rownames(cluster8genes),diffexpvalues.matched.meta.table.drop.na$Transcript.stable.ID.version),])
+
+### GO terms for group8
+ego.grp8 <- enrichGO(gene     = cluster8match.diffexpvalues.matched.meta.table.drop.na$gene_id,
+                universe      = raw.count.meta.table.drop.dup$gene_id,
+                OrgDb         = org.Hs.eg.db,
+                ont           = "ALL",
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 0.01,
+        readable      = TRUE)
+go.res.grp8 <- as.data.frame(ego.grp8@result) ## NO enriched
+
+##save plot
+png("grp8.GO.bar.png")
+barplot(ego.grp8, split="ONTOLOGY",showCategory = 10) + facet_grid(ONTOLOGY~., scale="free")
+dev.off()
+
+png("grp8.GO.dot.png")
+dotplot(ego.grp8, split="ONTOLOGY",showCategory = 10) + facet_grid(ONTOLOGY~., scale="free")
+dev.off()
+
+```
+
+```{r}
+## for group 9
+cluster9genes = diffexpvalues[diffexp.clust.groups==9, ]
+cluster9match.diffexpvalues.matched.meta.table.drop.na <- na.omit(diffexpvalues.matched.meta.table.drop.na[match(rownames(cluster9genes),diffexpvalues.matched.meta.table.drop.na$Transcript.stable.ID.version),])
+
+### GO terms for group9
+ego.grp9 <- enrichGO(gene     = cluster9match.diffexpvalues.matched.meta.table.drop.na$gene_id,
+                universe      = raw.count.meta.table.drop.dup$gene_id,
+                OrgDb         = org.Hs.eg.db,
+                ont           = "ALL",
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 0.01,
+        readable      = TRUE)
+go.res.grp9 <- as.data.frame(ego.grp9@result) ## NO enriched
+
+##save plot
+png("grp9.GO.bar.png")
+barplot(ego.grp9, split="ONTOLOGY",showCategory = 10) + facet_grid(ONTOLOGY~., scale="free")
+dev.off()
+
+png("grp9.GO.dot.png")
+dotplot(ego.grp9, split="ONTOLOGY",showCategory = 10) + facet_grid(ONTOLOGY~., scale="free")
+dev.off()
+```
