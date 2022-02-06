@@ -59,6 +59,7 @@ tab <- read.table("mart_export.txt", sep='\t', header=T)
 idx <- match(rownames(raw.count), tab$Transcript.stable.ID.version)
 meta.table <- tab[idx,]
 meta.table$Gene.name <- NULL
+
 library(org.Hs.eg.db)
 xxd <- toTable(org.Hs.egSYMBOL)
 yyd <- toTable(org.Hs.egENSEMBL2EG)
@@ -153,6 +154,48 @@ diffexpvalues <- normvalues[idx2,]
 write.table(diffexpvalues, file = paste0(pwd, "/diffexpvalues.csv"), sep = "\t", col.names = NA)
 
 dim(diffexpvalues)
+```
+
+```{r}
+resSig ## deseq results after filter for diff genes
+resSig$Transcript.stable.ID.version = rownames(resSig)
+resSig.merged.ann <- merge(as.data.frame(resSig),diffexpvalues.matched.meta.table.drop.na, by='Transcript.stable.ID.version')
+resSig.merged.ann$diffexpressed <- "NO"
+resSig.merged.ann$diffexpressed[resSig.merged.ann$log2FoldChange > 1 & resSig.merged.ann$pvalue < 0.05] <- "UP"
+resSig.merged.ann$diffexpressed[resSig.merged.ann$log2FoldChange < -1 & resSig.merged.ann$pvalue < 0.05] <- "DOWN"
+```
+
+```{r}
+## volcano plot
+library(dplyr)
+pwd <- getwd()
+mycolors <- c("red", "green", "black")
+names(mycolors) <- c("DOWN", "UP", "NO")
+resSig.merged.ann$delabel <- NA
+resSig.merged.ann$delabel[resSig$diffexpressed != "NO"] <- resSig.merged.ann$symbol.x[resSig$diffexpressed != "NO"]
+ordered.resSig.merged.ann <- resSig.merged.ann[order(resSig.merged.ann$padj),]
+
+write.table(ordered.resSig.merged.ann, file = paste0(pwd, "/ordered.resSig.merged.ann.csv"),sep = "\t", row.names = FALSE)
+
+ordered.filter.resSig.merged.ann <- ordered.resSig.merged.ann %>% filter(abs(log2FoldChange) > 1) %>% mutate(top20_symbol = "")
+
+write.table(ordered.filter.resSig.merged.ann, file = paste0(pwd, "/ordered.filter.resSig.merged.ann.csv"),sep = "\t", row.names = FALSE)
+
+ordered.filter.resSig.merged.ann$top20_symbol[1:20] <- as.character(ordered.filter.resSig.merged.ann$delabel[1:20])
+
+library(ggrepel)
+options(ggrepel.max.overlaps = Inf)
+
+png("volcano_plot_only_DE.png")
+ggplot(data=ordered.filter.resSig.merged.ann, aes(x=log2FoldChange, y=-log10(padj), col=diffexpressed)) + 
+  geom_point() + 
+  theme_minimal() +
+  geom_vline(xintercept=c(-1, 1), col="orange") +
+  geom_hline(yintercept=-log10(0.05), col="orange") +
+  scale_color_manual(values = mycolors) +
+  labs(col = "DE genes?") +
+  geom_text_repel(aes(label=top20_symbol))
+dev.off()
 ```
 
 ```{r}
@@ -313,29 +356,20 @@ diff.clust <- hclust(diff.dist, method='average')
 ##save cell plot
 diff.clust$labels <- expdesign$cell
 png("diffexp.clust.cell.png")
-diff.clust$labels <- expdesign$cell
 plot(diff.clust) ## samples cluster together according to cell type
-diff.clust %>% rect.hclust(k=3) ## with box of cluster
 dev.off()
 
 ##save condition plot
 diff.clust$labels <- expdesign$condition
 png("diffexp.clust.condition.png")
-diff.clust$labels <- expdesign$condition
 plot(diff.clust) ## some samples accroding to condition DONOT cluster together
-diff.clust %>% rect.hclust(k=3) ## clearly some ambigious grouping
 dev.off()
 
 ##save sample plot
 diff.clust$labels <- expdesign$sample
 png("diffexp.clust.sample.png")
-diff.clust$labels <- expdesign$sample
 plot(diff.clust) ## some samples accrording to sample DONOT cluster together
-diff.clust %>% rect.hclust(k=3)
 dev.off()
-
-
-
 ```
 
 ```{r fig.height=10, fig.width=10}
